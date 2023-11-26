@@ -30,9 +30,9 @@ from matplotlib import patches
 # -----------------------------------------------------------------------------
 
 # Folder where are saved
-PATH_DATA = 'C:/Users/jonas/Desktop/FF2/img/'
+PATH_DATA = 'img'
 # Folder where the result will be saved
-PATH_SAVE = 'C:/Users/jonas/Desktop/FF2/'
+PATH_SAVE = 'img'
 
 # Microscope properties
 MAGN = 4               # scope magnification
