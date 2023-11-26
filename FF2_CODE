@@ -1,0 +1,236 @@
+"""
+Created on Nov 17 2023
+
+@author: pdeanna
+         ndelouche
+
+Analysis of diffusion experiment images and fitting of error function
+
+"""
+# pylint: disable=no-member
+
+import pandas as pd
+import cv2
+import numpy as np
+from scipy.special import erf
+from scipy.optimize import curve_fit
+import matplotlib.pyplot as plt
+from matplotlib import patches
+
+# -----------------------------------------------------------------------------
+# Users parameters
+# -----------------------------------------------------------------------------
+
+# Folder where are saved
+PATH_DATA = 'C:/Users/jonas/Desktop/FF2/img/'
+# Folder where the result will be saved
+PATH_SAVE = 'C:/Users/jonas/Desktop/FF2/'
+
+# Microscope properties
+MAGN = 4               # scope magnification
+BIT = 8                # Leica camera bit depth
+LEVEL = 2 ** BIT - 1   # image's maximal value
+PXS = 0.00235 / MAGN   # conversion pixel to length [mm] for Leica camera
+
+# Microfluidics properties
+HEIGHT = 0.1             # thickness [mm]
+WIDTH = 0.5              # width [mm]
+AREA = WIDTH * HEIGHT    # cross sectional area [mm2] of the microfluidics
+DIST_IM = 2300*PXS + 40  # distance from the inlet where images are taken [mm]
+
+# Flow rate (put here all flow rates [rpm])
+FLOW_RPM = [100, 10, 5, 1]
+FLOW_EXPE = [flow * 0.832 for flow in FLOW_RPM]   # conversion flow rate [mL/min] or [cm3/min]
+
+flow_rate = [flow * 1e3/ 60 for flow in FLOW_EXPE]   # conversion flow rate [mm3/s]
+flow_vel = [flow / AREA for flow in flow_rate]  # velocity of flow [mm/s]
+
+# Image region of interest for cropping
+BORDER_X1 = 100
+BORDER_X2 = BORDER_X1 + 200
+BORDER_Y1 = 500
+BORDER_Y2 = 1250
+
+
+# Fitting function parameters
+INITIAL_VALUE = 1e-4   # initial values
+LOWER_BOUND = 1e-10    # define lower bound
+UPPER_BOUND = 1e1      # define upper bound
+
+# Figures parameters
+FONTSIZE = 16
+MARKERSIZE = 10
+LINEWIDTH = 1.3
+
+
+# -----------------------------------------------------------------------------
+# Data reading
+# -----------------------------------------------------------------------------
+
+# Reading fully saturated images for normalization
+im_full_water = cv2.imread(f"{PATH_DATA}/P2_Cmin_1.JPG",
+                           cv2.IMREAD_GRAYSCALE) / LEVEL
+im_full_blue = cv2.imread(f"{PATH_DATA}/P2_Cmax_1.JPG",
+                          cv2.IMREAD_GRAYSCALE) / LEVEL
+
+# -----------------------------------------------------------------------------
+# Initialization
+# -----------------------------------------------------------------------------
+
+# Image cropping
+im_full_water = im_full_water[BORDER_Y1:BORDER_Y2, BORDER_X1:BORDER_X2]
+im_full_blue = im_full_blue[BORDER_Y1:BORDER_Y2, BORDER_X1:BORDER_X2]
+
+# Images dimension
+NDY, NDX = im_full_water.shape
+
+# Creation of a sequence of positions along the image's horizontal axis
+pos = np.linspace(0, NDY * PXS, NDY)
+
+# Time for the fluid to cross the picture
+time = [DIST_IM / flow for flow in flow_vel]
+
+# Diffusion coefficient
+diff = np.zeros(len(FLOW_EXPE))
+diff2 = np.zeros(len(FLOW_EXPE))
+
+
+def func_erf(pos, diff, time, pos0):
+    """
+    Calculate the value of the error function for a given position.
+    """
+    return 0.5 * (1 - erf((pos - pos0) / np.sqrt(4 * diff * time)))
+
+
+# Threshold for the normalization
+CMIN = 0.002
+
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
+
+for p in range(len(flow_rate)):
+
+    original = cv2.imread(f"{PATH_DATA}Q_{FLOW_RPM[p]}.JPG",
+                          cv2.IMREAD_GRAYSCALE) / LEVEL
+
+    image = original.copy()
+    image = image[BORDER_Y1:BORDER_Y2, BORDER_X1:BORDER_X2]
+
+    # Normalization and smoothing
+    norm = (im_full_water - image) / (im_full_water - im_full_blue)
+    norm[norm < CMIN] = 0
+    norm[norm > 1] = 1
+    norm[np.isnan(norm)] = 0
+    norm = cv2.GaussianBlur(norm, (0, 0), 3)
+
+    # Gradient
+    normp = np.sum(norm, axis=1) / NDY
+    normp = (normp - np.min(normp)) / (np.max(normp) - np.min(normp))
+    gradp = np.abs(np.gradient(normp) / PXS)
+
+    # Gradient smoothing
+    series_gradp = pd.Series(gradp)
+    smoothed_gradp = series_gradp.rolling(window=50, center=True,
+                                          min_periods=1).mean()
+    gradp = gradp[:50//2].tolist() + smoothed_gradp[50//2:-50//2].tolist() + gradp[-50//2:].tolist()
+
+    pos0 = pos[np.where(normp < 1/2)[0][0]] if np.any(normp < 1/2) else None
+
+    def func(pos, normp):
+        """
+        Lambda func
+        """
+        return func_erf(pos, normp, time[p], pos0)
+
+    popt, pcov = curve_fit(func, pos, normp,
+                           bounds=(LOWER_BOUND, UPPER_BOUND), p0=INITIAL_VALUE)
+    diff[p] = popt[0]
+
+    # Calculate F and f using the fitted diffusion coefficient fitted_D
+    F = 0.5 * (1 - erf((pos - pos0) / np.sqrt(4 * diff[p] * time[p])))
+    f = 0.5 * (1 - erf((pos - pos0) / np.sqrt(4 * (2e-3) * time[p])))
+
+    #
+    gradp2 = np.array(gradp).copy()
+    ind = np.where(np.abs(pos - pos0) > 0.03)
+    gradp2[ind] = 0
+    gradp2 = gradp2 / np.sum(gradp2 * PXS)
+
+    sigma2 = np.sum((pos - pos0)**2 * gradp2 * PXS)
+    diff2[p] = sigma2 / (2*time[p])
+
+    # FIGURES
+    plt.figure(1)
+    plt.clf()
+    plt.imshow(original)
+    plt.set_cmap('gray')
+    plt.gca().invert_yaxis()
+    plt.gca().set_aspect('equal', adjustable='box')
+    rectangle = patches.Rectangle((BORDER_X1, BORDER_Y1),
+                                  BORDER_X2 - BORDER_X1,
+                                  BORDER_Y2 - BORDER_Y1,
+                                  linewidth=LINEWIDTH, edgecolor='r',
+                                  facecolor='none')
+    plt.gca().add_patch(rectangle)
+    #plt.savefig(PATH_SAVE + f"P2_exp_image_{p}.pdf", format='pdf', dpi=600,
+                #bbox_inches='tight', pad_inches=0.1)
+    plt.title("Original image and region of interest (ROI)")
+
+    plt.figure(2)
+    plt.clf()
+    plt.imshow(norm)
+    plt.gca().set_aspect('equal', adjustable='box')
+    plt.gca().invert_yaxis()
+    plt.set_cmap('hot')
+    plt.colorbar()
+    plt.title("Concentration in the ROI")
+    plt.show()
+    #plt.savefig(PATH_SAVE + f"P2_concentration_{p}.pdf", format='pdf', dpi=600,
+                #bbox_inches='tight', pad_inches=0.1)
+
+    plt.figure(3)
+    plt.clf()
+    plt.plot(pos, normp, 'r.', markersize=MARKERSIZE)
+    plt.plot(pos, gradp2 / max(gradp2), 'c')
+    plt.plot(pos, F, 'b')
+    plt.axis([-0.05, 0.5, -0.1, 1.1])
+    plt.title("Profile")
+    plt.show()
+    #plt.savefig(PATH_SAVE + f"P2_profile_{p}.pdf", format='pdf', dpi=600,
+                #bbox_inches='tight', pad_inches=0.1)
+
+plt.figure(4)
+plt.clf()
+plt.semilogy(time, diff, 'r.', markersize=MARKERSIZE, linewidth=LINEWIDTH)
+plt.plot(time, diff2, 'b.', markersize=MARKERSIZE, linewidth=LINEWIDTH)
+plt.plot(time, np.mean(diff) * np.ones_like(time), 'r',
+         markersize=MARKERSIZE, linewidth=LINEWIDTH)
+plt.plot(time, np.mean(diff2) * np.ones_like(time), 'b',
+         markersize=MARKERSIZE, linewidth=LINEWIDTH)
+plt.xlabel('time - [s]', fontsize=FONTSIZE)
+plt.ylabel('D diffusion coefficient - [mm$^2$/s]', fontsize=FONTSIZE)
+plt.show()
+#plt.savefig(PATH_SAVE + 'P2_diff_coeffT.pdf', format='pdf', dpi=600,
+            #bbox_inches='tight', pad_inches=0.1)
+
+plt.figure(5)
+plt.clf()
+plt.semilogy(FLOW_EXPE, diff, 'r.', markersize=MARKERSIZE, linewidth=LINEWIDTH)
+plt.plot(FLOW_EXPE, diff2, 'b.', markersize=MARKERSIZE, linewidth=LINEWIDTH)
+plt.plot(FLOW_EXPE, np.mean(diff) * np.ones_like(FLOW_EXPE), 'r',
+         markersize=MARKERSIZE, linewidth=LINEWIDTH)
+plt.plot(FLOW_EXPE, np.mean(diff2) * np.ones_like(FLOW_EXPE), 'b',
+         markersize=MARKERSIZE, linewidth=LINEWIDTH)
+plt.xlabel('Flow rate $Q$ - [mm$^3$/s]', fontsize=FONTSIZE)
+plt.ylabel('D diffusion coefficient - [mm$^2$/s]',  fontsize=FONTSIZE)
+plt.show()
+#plt.savefig(PATH_SAVE + 'P2_diff_coeffQ.pdf', format='pdf', dpi=600,
+            #bbox_inches='tight', pad_inches=0.1)
+
+print(f'The profile fitted diffusion coefficient is {np.mean(diff):.2e} mm2/s +-'
+      f'{np.std(diff):.1e} mm2/s')
+print(f'The gradient std diffusion coefficient is  {np.mean(diff2):.2e} mm2/s +-'
+      f'{np.std(diff2):.1e} mm2/s')
+
+print("Done.")
